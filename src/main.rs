@@ -2,9 +2,8 @@ use clap::{App, Arg};
 use regex::Regex;
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::Path;
-use std::process;
 
 fn main() -> io::Result<()> {
     let matches = App::new("SQL Formatter")
@@ -163,11 +162,11 @@ fn format_sql_inserts(sql: &str, verbose: bool) -> String {
         
         // Find the end of the VALUES section
         let mut depth = 1; // Starting with one opening parenthesis
-        let mut end_pos = header_end_pos;
+        let mut end_pos = *header_end_pos;
         let mut in_string = false;
         let mut escaped = false;
         
-        let chars: Vec<char> = result[header_end_pos..].chars().collect();
+        let chars: Vec<char> = result[*header_end_pos..].chars().collect();
         
         for (i, &c) in chars.iter().enumerate() {
             match c {
@@ -191,12 +190,12 @@ fn format_sql_inserts(sql: &str, verbose: bool) -> String {
                         depth -= 1;
                         if depth == 0 {
                             // Found the end of the VALUES section
-                            end_pos = header_end_pos + i + 1;
+                            end_pos = *header_end_pos + i + 1;
                             
                             // Look for a semicolon or another closing paren
                             for j in i+1..chars.len() {
                                 if chars[j] == ';' {
-                                    end_pos = header_end_pos + j + 1;
+                                    end_pos = *header_end_pos + j + 1;
                                     break;
                                 } else if !chars[j].is_whitespace() {
                                     break;
@@ -220,13 +219,13 @@ fn format_sql_inserts(sql: &str, verbose: bool) -> String {
         }
         
         // Extract the VALUES section
-        let values_section = &result[header_end_pos..end_pos];
+        let values_section = &result[*header_end_pos..end_pos];
         
         // Format the INSERT statement
         let formatted_insert = format_insert_statement(header, values_section, verbose);
         
         // Replace the original with the formatted version
-        result.replace_range(start_pos..end_pos, &formatted_insert);
+        result.replace_range(*start_pos..end_pos, &formatted_insert);
     }
     
     result
