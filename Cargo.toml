@@ -1,0 +1,8 @@
+[package]
+name = "cargo-sql-fmt"
+version = "0.1.0"
+edition = "2021"
+description = "Format SQL INSERT statements in a grid layout"
+
+[dependencies]
+regex = "1.10.2"
