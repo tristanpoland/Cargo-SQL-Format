@@ -1,8 +1,10 @@
 [package]
-name = "cargo-sql-fmt"
+name = "sql-fmt"
 version = "0.1.0"
 edition = "2021"
-description = "Format SQL files with proper alignment and structure"
+description = "Format SQL files with perfect grid alignment"
+authors = ["Tristan J. Poland"]
 
 [dependencies]
-regex = "1.10.2"
+regex = "1.10"
+clap = "2.34.0"  # Using clap v2 for simpler syntax
