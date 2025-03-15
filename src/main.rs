@@ -58,8 +58,10 @@ fn process_file(path: &PathBuf, write_to_file: bool) -> Result<(), Box<dyn std::
     // Format the content
     let formatted_content = format_sql(&content);
     
-    // Check if content actually changed
-    if content == formatted_content {
+    // Compare content lengths to detect changes
+    let content_changed = content.trim() != formatted_content.trim();
+    
+    if !content_changed {
         println!("No changes needed for: {}", path.display());
         return Ok(());
     }
@@ -159,26 +161,60 @@ fn format_insert_statement(stmt: &str) -> String {
     let values_data = &full_stmt[values_keyword_pos..];
     
     // Parse individual value tuples
-    let value_tuples_pattern = Regex::new(r"\(\s*[^)]+\s*\)").unwrap();
-    let mut value_tuples = Vec::new();
+    let tuple_pattern = Regex::new(r"\(\s*([^)]+)\s*\)").unwrap();
+    let mut values_content = Vec::new();
     
-    for value_match in value_tuples_pattern.find_iter(values_data) {
-        value_tuples.push(value_match.as_str().to_string());
+    for cap in tuple_pattern.captures_iter(values_data) {
+        if let Some(inner_match) = cap.get(1) {
+            // Split by comma but respect quotes
+            let value_items = split_values(inner_match.as_str());
+            values_content.push(value_items);
+        }
     }
     
     // Check for trailing semicolon
     let has_semicolon = stmt.trim_end().ends_with(';');
     
+    // Calculate column widths for alignment
+    let column_count = values_content.iter().map(|row| row.len()).max().unwrap_or(0);
+    let mut column_widths = vec![0; column_count];
+    
+    for row in &values_content {
+        for (i, item) in row.iter().enumerate() {
+            if i < column_count {
+                column_widths[i] = column_widths[i].max(item.len());
+            }
+        }
+    }
+    
     // Build the formatted statement
     let mut formatted = format!("{} {}", insert_part.trim(), values_keyword.trim());
     
-    for (i, tuple) in value_tuples.iter().enumerate() {
+    for (i, row) in values_content.iter().enumerate() {
         if i == 0 {
-            formatted.push_str("\n    ");
+            formatted.push_str("\n    (");
         } else {
-            formatted.push_str(",\n    ");
+            formatted.push_str(",\n    (");
         }
-        formatted.push_str(tuple.trim());
+        
+        // Add aligned columns
+        for (j, item) in row.iter().enumerate() {
+            if j > 0 {
+                formatted.push_str(", ");
+            }
+            
+            // Pad the item to align with the column width
+            let padding = if j < column_count - 1 {
+                " ".repeat(column_widths[j].saturating_sub(item.len()))
+            } else {
+                "".to_string() // Don't pad the last column
+            };
+            
+            formatted.push_str(item);
+            formatted.push_str(&padding);
+        }
+        
+        formatted.push(')');
     }
     
     // Add semicolon if needed
@@ -187,4 +223,35 @@ fn format_insert_statement(stmt: &str) -> String {
     }
     
     formatted
+}
+
+// Split values respecting quotes and keeping whitespace between values
+fn split_values(values_str: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut in_escaped = false;
+    
+    for c in values_str.chars() {
+        match c {
+            '\\' if !in_escaped => in_escaped = true,
+            '\'' if !in_escaped => in_quotes = !in_quotes,
+            ',' if !in_quotes && !in_escaped => {
+                result.push(current.trim().to_string());
+                current = String::new();
+            },
+            _ => {
+                if in_escaped {
+                    in_escaped = false;
+                }
+                current.push(c);
+            }
+        }
+    }
+    
+    if !current.trim().is_empty() {
+        result.push(current.trim().to_string());
+    }
+    
+    result
 }
