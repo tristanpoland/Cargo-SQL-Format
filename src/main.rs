@@ -181,6 +181,16 @@ fn format_file(path: &str, verbose: bool, dry_run: bool, backup: bool) -> io::Re
 }
 
 // The main formatting function that dispatches to specific formatters
+// Column type enum for better formatting decisions
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ColumnType {
+    String,
+    Number,
+    Null,
+    Function,
+    Unknown
+}
+
 fn format_sql(sql: &str, verbose: bool) -> String {
     if verbose {
         println!("Formatting SQL");
@@ -202,7 +212,7 @@ fn format_inserts(sql: &str, verbose: bool) -> String {
     }
     
     // Find all INSERT statements with an improved regex
-    let insert_regex = Regex::new(r#"(?is)(INSERT\s+INTO\s+[\w\.`\[\]\"]+\s*\([^)]+\))\s*VALUES\s*"#).unwrap();
+    let insert_regex = Regex::new(r#"(?is)(INSERT\s+INTO\s+[\w\.`\[\]"]+\s*\([^)]+\))\s*VALUES\s*"#).unwrap();
     
     let mut result = String::from(sql);
     
@@ -232,13 +242,22 @@ fn format_inserts(sql: &str, verbose: bool) -> String {
             println!("Formatting INSERT statement {}", i + 1);
         }
         
-        let new_sql = try_format_insert_values(&header, &values_section.to_string(), verbose);
+        let new_sql = try_format_insert_values(&header, &values_section, verbose);
         
         // Replace only if formatting was successful
         if !new_sql.is_empty() {
+            // Check if the values section ends with a comma (multi-statement)
+            let is_multi_statement = values_section.trim_end().ends_with(',');
+            // If this is a multi-statement insert, keep the trailing comma
+            let final_sql = if is_multi_statement && !new_sql.ends_with(',') {
+                format!("{},", new_sql.trim_end_matches(';'))
+            } else {
+                new_sql
+            };
+            
             result.replace_range(
                 start_pos..(end_header_pos + values_section.len()),
-                &new_sql
+                &final_sql
             );
         }
     }
@@ -410,7 +429,33 @@ fn try_format_insert_values(header: &str, values_section: &str, verbose: bool) -
         return String::new();
     }
     
-    // Step 3: Find the max length of each column across all rows
+    // Step 3: Analyze column types across all rows
+    let mut col_types = vec![ColumnType::Unknown; first_row_cols]; 
+    
+    for row in &rows {
+        for (i, col) in row.iter().enumerate() {
+            if i < col_types.len() {
+                let col_str = col.trim();
+                
+                // Determine column type based on content
+                if col_str.starts_with('\'') && col_str.ends_with('\'') {
+                    // String literal
+                    col_types[i] = ColumnType::String;
+                } else if col_str.parse::<f64>().is_ok() || col_str.parse::<i64>().is_ok() {
+                    // Numeric value
+                    col_types[i] = ColumnType::Number;
+                } else if col_str.to_uppercase() == "NULL" {
+                    // NULL value
+                    col_types[i] = ColumnType::Null;
+                } else if col_str.contains('(') && col_str.contains(')') {
+                    // Function call or expression
+                    col_types[i] = ColumnType::Function;
+                }
+            }
+        }
+    }
+    
+    // Step 4: Find the max length of each column across all rows
     let mut col_widths = vec![0; first_row_cols];
     
     for row in &rows {
@@ -421,7 +466,7 @@ fn try_format_insert_values(header: &str, values_section: &str, verbose: bool) -
         }
     }
     
-    // Step 4: Format each row with consistent spacing
+    // Step 5: Format each row with consistent spacing
     let mut formatted_rows = Vec::new();
     
     for row in rows {
@@ -430,17 +475,19 @@ fn try_format_insert_values(header: &str, values_section: &str, verbose: bool) -
         for (i, col) in row.iter().enumerate() {
             let col_str = col.trim();
             
-            // Determine if this is a value that should be right-aligned
-            let is_number = col_str.parse::<f64>().is_ok() 
-                || col_str.parse::<i64>().is_ok() 
-                || col_str.to_uppercase() == "NULL";
-            
-            if is_number {
-                // Right-align numbers and NULLs
-                formatted_cols.push(format!("{:>width$}", col_str, width = col_widths[i]));
-            } else {
-                // Left-align everything else (strings, functions, etc.)
-                formatted_cols.push(format!("{:<width$}", col_str, width = col_widths[i]));
+            match col_types[i] {
+                ColumnType::Function => {
+                    // Don't pad function calls or complex expressions - preserve exactly
+                    formatted_cols.push(col_str.to_string());
+                },
+                ColumnType::Number | ColumnType::Null => {
+                    // Right-align numbers and NULLs
+                    formatted_cols.push(format!("{:>width$}", col_str, width = col_widths[i]));
+                },
+                _ => {
+                    // Left-align everything else (strings, etc.)
+                    formatted_cols.push(format!("{:<width$}", col_str, width = col_widths[i]));
+                }
             }
         }
         
