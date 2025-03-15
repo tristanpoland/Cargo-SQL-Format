@@ -79,6 +79,7 @@ fn format_sql(sql: &str) -> String {
     let mut result = String::new();
     let mut current_insert: Option<InsertStatement> = None;
     let mut buffer = Vec::new();
+    let mut is_first_statement = true;
     
     // First pass: collect all INSERT statements
     for line in sql.lines() {
@@ -89,7 +90,17 @@ fn format_sql(sql: &str) -> String {
             if let Some(insert) = current_insert.take() {
                 // Format the previous INSERT statement
                 let formatted = format_insert_statement(insert);
+                
+                // Add a blank line between statements, but not before the first one
+                if !is_first_statement {
+                    result.push_str("\n");
+                }
+                is_first_statement = false;
+                
                 result.push_str(&formatted);
+            } else {
+                // This is the first INSERT statement
+                is_first_statement = true;
             }
             
             // Extract column names
@@ -112,6 +123,9 @@ fn format_sql(sql: &str) -> String {
                 // Check if this is the last row (has terminator)
                 if trimmed.ends_with(");") {
                     insert.terminator = ");".to_string();
+                } else if trimmed.contains(";);") {
+                    // Handle malformed terminators
+                    insert.terminator = ");".to_string();
                 }
             } else if !trimmed.is_empty() {
                 // Other line that's part of the INSERT statement
@@ -127,6 +141,12 @@ fn format_sql(sql: &str) -> String {
     // Format the last INSERT statement if any
     if let Some(insert) = current_insert {
         let formatted = format_insert_statement(insert);
+        
+        // Add a blank line before the last statement if needed
+        if !is_first_statement {
+            result.push_str("\n");
+        }
+        
         result.push_str(&formatted);
     }
     
@@ -166,7 +186,10 @@ fn parse_values_row(line: &str) -> Vec<String> {
     let mut paren_level = 0;
     let mut first_paren_found = false;
     
-    for c in line.chars() {
+    // Clean up the line first - remove any trailing comma before closing parenthesis
+    let cleaned_line = line.trim().replace(" ,)", ")").replace(",)", ")");
+    
+    for c in cleaned_line.chars() {
         if !escaped && (c == '\'' || c == '"') {
             current.push(c);
             if !in_quotes {
@@ -255,7 +278,13 @@ fn format_insert_statement(insert: InsertStatement) -> String {
         
         // Add row terminator
         if i == insert.rows.len() - 1 {
-            result.push_str(&insert.terminator);
+            // Fix malformed terminators like ";);" to just ");"
+            let terminator = if insert.terminator.contains(";);") {
+                ");".to_string()
+            } else {
+                insert.terminator.clone()
+            };
+            result.push_str(&terminator);
         } else {
             result.push_str("),");
         }
