@@ -26,20 +26,41 @@ struct Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     
-    // Expand the glob pattern to get matching files
-    let paths = glob(&args.input)?;
+    // Handle both shell-style paths and glob patterns
+    let input_path = Path::new(&args.input);
     let mut processed_files = 0;
     
-    for entry in paths {
-        match entry {
-            Ok(path) => {
-                // Only process files with .sql extension
-                if path.extension().map_or(false, |ext| ext.to_str().unwrap_or("") == "sql") {
+    if input_path.exists() && input_path.is_file() {
+        // Direct file path
+        if input_path.extension().map_or(false, |ext| ext.to_str().unwrap_or("") == "sql") {
+            process_file(input_path, !args.print, args.force)?;
+            processed_files += 1;
+        }
+    } else if input_path.exists() && input_path.is_dir() {
+        // Directory path - process all .sql files in it
+        for entry in fs::read_dir(input_path)? {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.is_file() && path.extension().map_or(false, |ext| ext.to_str().unwrap_or("") == "sql") {
                     process_file(&path, !args.print, args.force)?;
                     processed_files += 1;
                 }
             }
-            Err(e) => eprintln!("Error matching glob pattern: {}", e),
+        }
+    } else {
+        // Treat as glob pattern
+        let paths = glob(&args.input)?;
+        for entry in paths {
+            match entry {
+                Ok(path) => {
+                    // Only process files with .sql extension
+                    if path.extension().map_or(false, |ext| ext.to_str().unwrap_or("") == "sql") {
+                        process_file(&path, !args.print, args.force)?;
+                        processed_files += 1;
+                    }
+                }
+                Err(e) => eprintln!("Error matching glob pattern: {}", e),
+            }
         }
     }
     
@@ -52,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn process_file(path: &PathBuf, write_to_file: bool, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn process_file(path: &Path, write_to_file: bool, force: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("Processing file: {}", path.display());
     
     // Read file content
@@ -83,80 +104,104 @@ fn process_file(path: &PathBuf, write_to_file: bool, force: bool) -> Result<(), 
 }
 
 fn format_sql(sql: &str) -> String {
-    // Split the SQL by INSERT statements to process each separately
-    let insert_pattern = Regex::new(r"(?i)INSERT\s+INTO\s+[^\(]+\([^\)]+\)\s*VALUES\s*\n").unwrap();
+    // Process each INSERT statement with VALUES separately
     let mut result = String::new();
-    let mut last_end = 0;
+    let mut last_pos = 0;
+    
+    // Use a more specific regex to find INSERT statements
+    let insert_pattern = Regex::new(r"(?im)^INSERT\s+INTO\s+\w+\s*\([^)]+\)\s*VALUES\s*").unwrap();
     
     for insert_match in insert_pattern.find_iter(sql) {
-        // Add everything before this INSERT statement
-        result.push_str(&sql[last_end..insert_match.start()]);
+        // Add everything up to this INSERT statement
+        result.push_str(&sql[last_pos..insert_match.start()]);
         
-        // Get the INSERT statement header (everything before VALUES)
-        let insert_header = &sql[insert_match.start()..insert_match.end()];
-        result.push_str(insert_header);
+        // Extract and add the INSERT header
+        let header_end = insert_match.end();
+        result.push_str(&sql[insert_match.start()..header_end]);
         
-        // Find the end of this INSERT statement's values
-        let values_start = insert_match.end();
-        let mut values_end = values_start;
-        let mut paren_count = 0;
-        let mut in_string = false;
+        // Find all VALUES rows for this INSERT statement
+        let mut value_block_start = header_end;
+        let mut value_block_end = header_end;
+        let mut in_value_block = true;
         let mut values_lines = Vec::new();
         let mut current_line = String::new();
+        let mut line_start = value_block_start;
         
-        // Extract value lines
-        for (i, c) in sql[values_start..].char_indices() {
-            if c == '\'' && (i == 0 || &sql[values_start + i - 1..values_start + i] != "\\") {
-                in_string = !in_string;
-            }
-            
-            if !in_string {
-                if c == '(' {
-                    paren_count += 1;
-                } else if c == ')' {
-                    paren_count -= 1;
-                }
+        // Scan through the next part of SQL to extract VALUES rows
+        for (i, c) in sql[header_end..].chars().enumerate() {
+            if !in_value_block {
+                break;
             }
             
             current_line.push(c);
             
-            if c == '\n' || (c == ';' && paren_count == 0) {
-                if !current_line.trim().is_empty() {
-                    values_lines.push(current_line);
-                    current_line = String::new();
+            if c == ';' || c == '\n' {
+                // End of a line
+                let trimmed = current_line.trim();
+                
+                if !trimmed.is_empty() {
+                    // Skip the VALUES keyword if it appears on its own line
+                    if !(trimmed.eq_ignore_ascii_case("values") || 
+                         trimmed.eq_ignore_ascii_case("values (")) {
+                        values_lines.push((line_start, header_end + i + 1, current_line.clone()));
+                    }
                 }
                 
-                if c == ';' && paren_count == 0 {
-                    values_end = values_start + i + 1;
-                    break;
+                if c == ';' {
+                    // End of values block
+                    value_block_end = header_end + i + 1;
+                    in_value_block = false;
                 }
+                
+                current_line.clear();
+                line_start = header_end + i + 1;
+            } else if i > 0 && i + header_end < sql.len() && 
+                      !trimmed_starts_with(
+                          &sql[header_end + i..].chars().take(20).collect::<String>(), 
+                          "("
+                      ) &&
+                      (c == 'I' || c == 'i') && 
+                      trimmed_starts_with(
+                          &sql[header_end + i..].chars().take(20).collect::<String>(), 
+                          "INSERT"
+                      ) {
+                // Detected start of next INSERT statement
+                value_block_end = header_end + i;
+                in_value_block = false;
+                break;
             }
         }
         
-        // If we didn't find a semicolon, include the rest of the content
-        if values_end == values_start {
-            values_end = sql.len();
-            // Add any remaining content
+        // If we reached the end of the string without finding a semicolon
+        if in_value_block && value_block_end == header_end {
+            value_block_end = sql.len();
+            
+            // Add any remaining content if we didn't add it already
             if !current_line.is_empty() {
-                values_lines.push(current_line);
+                values_lines.push((line_start, value_block_end, current_line));
             }
         }
         
-        // Format value lines (ONLY align columns, don't change syntax)
+        // Format the values lines
         if !values_lines.is_empty() {
-            let formatted_values = format_values(&values_lines);
+            let formatted_values = format_values_lines(&values_lines);
             result.push_str(&formatted_values);
         }
         
-        last_end = values_end;
+        last_pos = value_block_end;
+        
+        // Safety check to prevent infinite loop
+        if value_block_end <= insert_match.start() {
+            break;
+        }
     }
     
     // Add any remaining SQL after the last INSERT
-    if last_end < sql.len() {
-        result.push_str(&sql[last_end..]);
+    if last_pos < sql.len() {
+        result.push_str(&sql[last_pos..]);
     }
     
-    // If no INSERT statements were found, return the original SQL
+    // If no changes were made, return the original SQL
     if result.is_empty() {
         return sql.to_string();
     }
@@ -164,60 +209,79 @@ fn format_sql(sql: &str) -> String {
     result
 }
 
-fn format_values(lines: &[String]) -> String {
-    // Find columns in each line by splitting between parentheses
+// Helper function to check if a string starts with another string (ignoring whitespace)
+fn trimmed_starts_with(s: &str, prefix: &str) -> bool {
+    s.trim_start().to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase())
+}
+
+fn format_values_lines(lines: &[(usize, usize, String)]) -> String {
+    // Parse and extract column values
     let mut all_columns = Vec::new();
     
-    for line in lines {
+    for (_, _, line) in lines {
         let trimmed = line.trim();
         
-        // Skip if not a value line
+        // Skip lines that don't start with a value tuple
         if !trimmed.starts_with('(') {
             continue;
         }
         
         // Extract content between parentheses
-        let open_paren = trimmed.find('(').unwrap_or(0);
-        let close_paren = trimmed.rfind(')').unwrap_or(trimmed.len());
+        let mut in_parens = false;
+        let mut depth = 0;
+        let mut columns = Vec::new();
+        let mut current = String::new();
+        let mut in_string = false;
         
-        if open_paren < close_paren {
-            let content = &trimmed[open_paren + 1..close_paren];
-            let mut columns = Vec::new();
-            let mut current = String::new();
-            let mut in_string = false;
-            let mut paren_level = 0;
-            
-            // Split by commas, but respect strings and nested parentheses
-            for c in content.chars() {
-                if c == '\'' && (current.is_empty() || current.chars().last().unwrap() != '\\') {
-                    in_string = !in_string;
+        for c in trimmed.chars() {
+            if c == '\'' && !in_string {
+                in_string = true;
+                current.push(c);
+            } else if c == '\'' && in_string {
+                // Check for escaped quotes
+                if current.ends_with('\\') {
+                    current.push(c);
+                } else {
+                    in_string = false;
+                    current.push(c);
                 }
-                
-                if !in_string {
-                    if c == '(' {
-                        paren_level += 1;
-                    } else if c == ')' {
-                        paren_level -= 1;
-                    }
-                }
-                
-                if c == ',' && !in_string && paren_level == 0 {
-                    columns.push(current.trim().to_string());
-                    current = String::new();
+            } else if c == '(' && !in_string {
+                depth += 1;
+                if depth == 1 {
+                    in_parens = true;
                 } else {
                     current.push(c);
                 }
-            }
-            
-            if !current.trim().is_empty() {
+            } else if c == ')' && !in_string {
+                depth -= 1;
+                if depth == 0 {
+                    in_parens = false;
+                    if !current.trim().is_empty() {
+                        columns.push(current.trim().to_string());
+                    }
+                    current.clear();
+                } else {
+                    current.push(c);
+                }
+            } else if c == ',' && depth == 1 && !in_string {
                 columns.push(current.trim().to_string());
+                current.clear();
+            } else if in_parens {
+                current.push(c);
             }
-            
+        }
+        
+        if !columns.is_empty() {
             all_columns.push(columns);
         }
     }
     
     // Find max width for each column
+    if all_columns.is_empty() {
+        // If we couldn't parse column values, return original lines
+        return lines.iter().map(|(_, _, line)| line.clone()).collect::<String>();
+    }
+    
     let max_cols = all_columns.iter().map(|cols| cols.len()).max().unwrap_or(0);
     let mut col_widths = vec![0; max_cols];
     
@@ -231,21 +295,20 @@ fn format_values(lines: &[String]) -> String {
     
     // Format each line
     let mut result = String::new();
-    let mut line_idx = 0;
+    let mut col_idx = 0;
     
-    for line in lines {
+    for (_, _, line) in lines {
         let trimmed = line.trim();
         
-        if trimmed.starts_with('(') && line_idx < all_columns.len() {
-            // Format value line
-            let columns = &all_columns[line_idx];
-            let indent = if line.starts_with(' ') {
-                line.chars().take_while(|&c| c == ' ').count()
-            } else {
-                4 // Default indent
-            };
+        if trimmed.starts_with('(') && col_idx < all_columns.len() {
+            // Format this value line with column alignment
+            let columns = &all_columns[col_idx];
             
-            result.push_str(&" ".repeat(indent));
+            // Calculate indentation by counting spaces at beginning of line
+            let indent = line.chars().take_while(|&c| c.is_whitespace()).count();
+            let indent_spaces = if indent > 0 { indent } else { 4 };
+            
+            result.push_str(&" ".repeat(indent_spaces));
             result.push('(');
             
             for (i, col) in columns.iter().enumerate() {
@@ -272,7 +335,7 @@ fn format_values(lines: &[String]) -> String {
             }
             
             result.push('\n');
-            line_idx += 1;
+            col_idx += 1;
         } else {
             // Keep the line as is
             result.push_str(line);
