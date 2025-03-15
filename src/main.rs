@@ -5,7 +5,7 @@ use glob::glob;
 use regex::Regex;
 use clap::Parser;
 
-/// SQL formatter that focuses on formatting INSERT statements
+/// SQL formatter that focuses on formatting INSERT statements with column alignment
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
@@ -16,6 +16,10 @@ struct Args {
     /// Print to stdout instead of writing back to files
     #[clap(short, long)]
     print: bool,
+    
+    /// Force formatting even if no changes are detected
+    #[clap(short, long)]
+    force: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(path) => {
                 // Only process files with .sql extension
                 if path.extension().map_or(false, |ext| ext.to_str().unwrap_or("") == "sql") {
-                    process_file(&path, !args.print)?;
+                    process_file(&path, !args.print, args.force)?;
                     processed_files += 1;
                 }
             }
@@ -47,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn process_file(path: &PathBuf, write_to_file: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn process_file(path: &PathBuf, write_to_file: bool, force: bool) -> Result<(), Box<dyn std::error::Error>> {
     println!("Processing file: {}", path.display());
     
     // Read file content
@@ -58,10 +62,12 @@ fn process_file(path: &PathBuf, write_to_file: bool) -> Result<(), Box<dyn std::
     // Format the content
     let formatted_content = format_sql(&content);
     
-    // Compare content lengths to detect changes
-    let content_changed = content.trim() != formatted_content.trim();
+    // Check if content actually changed (ignoring whitespace differences at line ends)
+    let content_normalized = normalize_whitespace(&content);
+    let formatted_normalized = normalize_whitespace(&formatted_content);
+    let content_changed = content_normalized != formatted_normalized;
     
-    if !content_changed {
+    if !content_changed && !force {
         println!("No changes needed for: {}", path.display());
         return Ok(());
     }
@@ -79,170 +85,202 @@ fn process_file(path: &PathBuf, write_to_file: bool) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-fn format_sql(sql: &str) -> String {
-    // Regex to match INSERT statements
-    let insert_regex = Regex::new(r"(?i)(INSERT\s+INTO\s+\w+\s*\([^)]+\))\s*VALUES\s*").unwrap();
+// Normalize whitespace for comparison to ignore formatting-only changes
+fn normalize_whitespace(s: &str) -> String {
+    let mut result = String::new();
+    let mut prev_char_is_whitespace = false;
     
-    // Split the SQL by lines to process each statement
-    let lines: Vec<&str> = sql.lines().collect();
-    let mut formatted_lines = Vec::new();
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_char_is_whitespace {
+                result.push(' ');
+                prev_char_is_whitespace = true;
+            }
+        } else {
+            result.push(c);
+            prev_char_is_whitespace = false;
+        }
+    }
+    
+    result
+}
+
+fn format_sql(sql: &str) -> String {
+    let mut lines = sql.lines().collect::<Vec<_>>();
+    let mut result = Vec::new();
     let mut i = 0;
     
     while i < lines.len() {
-        let line = lines[i];
+        let line = lines[i].trim();
         
-        // Check if this line contains an INSERT statement
-        if insert_regex.is_match(line) {
-            let mut insert_statement = line.to_string();
+        // Look for INSERT statements
+        if line.to_uppercase().starts_with("INSERT INTO") {
+            let mut insert_block = Vec::new();
+            insert_block.push(line.to_string());
             
-            // Look ahead for VALUES clause and format it
+            // Find the VALUES keyword
             let mut j = i + 1;
-            while j < lines.len() && !lines[j].trim().starts_with(";") {
-                insert_statement.push_str("\n");
-                insert_statement.push_str(lines[j]);
+            let mut values_found = false;
+            
+            while j < lines.len() {
+                let next_line = lines[j].trim();
+                insert_block.push(next_line.to_string());
+                
+                // Check if this line contains the VALUES keyword
+                if next_line.to_uppercase().contains("VALUES") {
+                    values_found = true;
+                    break;
+                }
+                
                 j += 1;
             }
             
-            // If we found a semicolon, include it
-            if j < lines.len() && lines[j].trim().starts_with(";") {
-                insert_statement.push_str("\n");
-                insert_statement.push_str(lines[j]);
+            // If VALUES is found, collect all value tuples
+            if values_found {
                 j += 1;
+                while j < lines.len() {
+                    let next_line = lines[j].trim();
+                    
+                    // Stop when we reach a line that doesn't look like part of the INSERT statement
+                    if next_line.is_empty() || (next_line.starts_with("--") && !next_line.contains("(")) || 
+                       (next_line.to_uppercase().starts_with("INSERT") || 
+                        next_line.to_uppercase().starts_with("UPDATE") || 
+                        next_line.to_uppercase().starts_with("DELETE") || 
+                        next_line.to_uppercase().starts_with("CREATE") || 
+                        next_line.to_uppercase().starts_with("ALTER") || 
+                        next_line.to_uppercase().starts_with("DROP")) && !next_line.contains(",") {
+                        break;
+                    }
+                    
+                    insert_block.push(next_line.to_string());
+                    
+                    // If we reach a line with a semicolon and no comma, we're done with this INSERT statement
+                    if next_line.ends_with(";") && !next_line.ends_with(",;") {
+                        j += 1;
+                        break;
+                    }
+                    
+                    j += 1;
+                }
+                
+                // Format the entire INSERT statement
+                let formatted_insert = format_insert_statement(&insert_block.join(" "));
+                result.push(formatted_insert);
+                
+                // Skip ahead to the next part of the file
+                i = j;
+                continue;
             }
-            
-            // Format the collected INSERT statement
-            let formatted_insert = format_insert_statement(&insert_statement);
-            formatted_lines.push(formatted_insert);
-            
-            // Skip the lines we've processed
-            i = j;
-        } else {
-            // Keep non-INSERT lines as is
-            formatted_lines.push(line.to_string());
-            i += 1;
         }
+        
+        // For non-INSERT lines, just add them as is
+        result.push(lines[i].to_string());
+        i += 1;
     }
     
-    formatted_lines.join("\n")
+    result.join("\n")
 }
 
 fn format_insert_statement(stmt: &str) -> String {
-    // First, check if this is a multi-line INSERT statement
-    let lines: Vec<&str> = stmt.lines().collect();
-    if lines.len() <= 1 {
-        return stmt.to_string(); // Already a single line, return as is
+    // Clean up extra whitespace
+    let stmt = stmt.trim().replace("\n", " ");
+    
+    // Split into INSERT part and VALUES part
+    let parts: Vec<&str> = stmt.split("VALUES").collect();
+    if parts.len() != 2 {
+        return stmt.to_string(); // Not a standard INSERT ... VALUES format
     }
     
-    // Find the INSERT INTO part and VALUES part
-    let insert_pattern = Regex::new(r"(?i)^(INSERT\s+INTO\s+\w+\s*\([^)]+\))").unwrap();
-    let values_pattern = Regex::new(r"(?i)\bVALUES\s*").unwrap();
+    let insert_part = parts[0].trim();
+    let values_part = parts[1].trim();
     
-    let mut insert_part = String::new();
-    let mut full_stmt = stmt.to_string();
+    // Extract value tuples
+    let tuple_regex = Regex::new(r"\(\s*([^)]+)\s*\)").unwrap();
+    let mut tuples = Vec::new();
     
-    // Extract INSERT INTO part
-    if let Some(insert_match) = insert_pattern.find(full_stmt.as_str()) {
-        insert_part = insert_match.as_str().to_string();
-        // Remove the INSERT part from the full statement
-        full_stmt = full_stmt[insert_match.end()..].to_string();
-    } else {
-        return stmt.to_string(); // Couldn't find INSERT INTO part
-    }
-    
-    // Format VALUES
-    let mut values_keyword_pos = 0;
-    if let Some(values_match) = values_pattern.find(full_stmt.as_str()) {
-        values_keyword_pos = values_match.end();
-    } else {
-        return stmt.to_string(); // Couldn't find VALUES keyword
-    }
-    
-    let values_keyword = &full_stmt[..values_keyword_pos];
-    let values_data = &full_stmt[values_keyword_pos..];
-    
-    // Parse individual value tuples
-    let tuple_pattern = Regex::new(r"\(\s*([^)]+)\s*\)").unwrap();
-    let mut values_content = Vec::new();
-    
-    for cap in tuple_pattern.captures_iter(values_data) {
-        if let Some(inner_match) = cap.get(1) {
-            // Split by comma but respect quotes
-            let value_items = split_values(inner_match.as_str());
-            values_content.push(value_items);
+    for cap in tuple_regex.captures_iter(values_part) {
+        if let Some(inside_tuple) = cap.get(1) {
+            let values = parse_values(inside_tuple.as_str());
+            tuples.push(values);
         }
     }
     
-    // Check for trailing semicolon
-    let has_semicolon = stmt.trim_end().ends_with(';');
+    if tuples.is_empty() {
+        return stmt.to_string(); // No tuples found
+    }
     
-    // Calculate column widths for alignment
-    let column_count = values_content.iter().map(|row| row.len()).max().unwrap_or(0);
-    let mut column_widths = vec![0; column_count];
+    // Find max width for each column
+    let num_columns = tuples.iter().map(|v| v.len()).max().unwrap_or(0);
+    let mut column_widths = vec![0; num_columns];
     
-    for row in &values_content {
-        for (i, item) in row.iter().enumerate() {
-            if i < column_count {
-                column_widths[i] = column_widths[i].max(item.len());
+    for tuple in &tuples {
+        for (i, value) in tuple.iter().enumerate() {
+            if i < column_widths.len() {
+                column_widths[i] = column_widths[i].max(value.len());
             }
         }
     }
     
-    // Build the formatted statement
-    let mut formatted = format!("{} {}", insert_part.trim(), values_keyword.trim());
+    // Format the statement
+    let mut result = String::new();
+    result.push_str(insert_part);
+    result.push_str("\nVALUES\n");
     
-    for (i, row) in values_content.iter().enumerate() {
-        if i == 0 {
-            formatted.push_str("\n    (");
-        } else {
-            formatted.push_str(",\n    (");
+    for (i, tuple) in tuples.iter().enumerate() {
+        if i > 0 {
+            result.push_str(",\n");
         }
         
-        // Add aligned columns
-        for (j, item) in row.iter().enumerate() {
+        result.push_str("    (");
+        
+        for (j, value) in tuple.iter().enumerate() {
             if j > 0 {
-                formatted.push_str(", ");
+                result.push_str(", ");
             }
             
-            // Pad the item to align with the column width
-            let padding = if j < column_count - 1 {
-                " ".repeat(column_widths[j].saturating_sub(item.len()))
-            } else {
-                "".to_string() // Don't pad the last column
-            };
+            result.push_str(value);
             
-            formatted.push_str(item);
-            formatted.push_str(&padding);
+            // Add padding, except for the last column
+            if j < tuple.len() - 1 {
+                let padding = " ".repeat(column_widths[j].saturating_sub(value.len()));
+                result.push_str(&padding);
+            }
         }
         
-        formatted.push(')');
+        result.push(')');
     }
     
-    // Add semicolon if needed
-    if has_semicolon {
-        formatted.push(';');
+    // Add semicolon if the original statement had one
+    if values_part.trim_end().ends_with(';') {
+        result.push(';');
     }
     
-    formatted
+    result
 }
 
-// Split values respecting quotes and keeping whitespace between values
-fn split_values(values_str: &str) -> Vec<String> {
+fn parse_values(values_str: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
-    let mut in_escaped = false;
+    let mut escape_next = false;
     
     for c in values_str.chars() {
         match c {
-            '\\' if !in_escaped => in_escaped = true,
-            '\'' if !in_escaped => in_quotes = !in_quotes,
-            ',' if !in_quotes && !in_escaped => {
+            '\\' if !escape_next => {
+                escape_next = true;
+                current.push(c);
+            },
+            '\'' if !escape_next => {
+                in_quotes = !in_quotes;
+                current.push(c);
+            },
+            ',' if !in_quotes && !escape_next => {
                 result.push(current.trim().to_string());
                 current = String::new();
             },
             _ => {
-                if in_escaped {
-                    in_escaped = false;
+                if escape_next {
+                    escape_next = false;
                 }
                 current.push(c);
             }
