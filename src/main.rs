@@ -140,40 +140,94 @@ fn format_sql_inserts(sql: &str, verbose: bool) -> String {
         println!("Formatting INSERT statements");
     }
     
-    // Find all INSERT statements - improved regex to better match complete statements
-    let insert_regex = Regex::new(r"(?is)(INSERT\s+INTO\s+[\w\.]+\s*\([^)]+\))\s*VALUES\s*\n?\s*\(([^;]+)(?:;|\)\)\)|$)").unwrap();
+    // Find all INSERT statements with improved regex
+    let insert_regex = Regex::new(r"(?is)(INSERT\s+INTO\s+[\w\.]+\s*\([^)]+\))\s*VALUES\s*\n?\s*\(").unwrap();
     
     let mut result = String::from(sql);
-    let mut offset = 0;
     
-    for captures in insert_regex.captures_iter(sql) {
+    // Find all matches first
+    let mut matches = Vec::new();
+    for captures in insert_regex.captures_iter(&sql) {
+        let header = captures.get(1).unwrap().as_str();
+        let start_pos = captures.get(0).unwrap().start();
+        let header_end_pos = start_pos + captures.get(0).unwrap().as_str().len();
+        
+        matches.push((header.to_string(), start_pos, header_end_pos));
+    }
+    
+    // Process matches in reverse order to avoid offset issues
+    for (index, (header, start_pos, header_end_pos)) in matches.iter().enumerate().rev() {
         if verbose {
-            println!("Found INSERT statement to format");
+            println!("Processing INSERT statement {}", index + 1);
         }
         
-        let full_match = captures.get(0).unwrap();
-        let start_pos = full_match.start();
-        let end_pos = full_match.end();
-        let match_len = end_pos - start_pos;
+        // Find the end of the VALUES section
+        let mut depth = 1; // Starting with one opening parenthesis
+        let mut end_pos = header_end_pos;
+        let mut in_string = false;
+        let mut escaped = false;
         
-        let header = captures.get(1).unwrap().as_str();
-        let values_section = captures.get(2).unwrap().as_str();
+        let chars: Vec<char> = result[header_end_pos..].chars().collect();
+        
+        for (i, &c) in chars.iter().enumerate() {
+            match c {
+                '\\' => {
+                    escaped = !escaped;
+                },
+                '\'' => {
+                    if !escaped {
+                        in_string = !in_string;
+                    }
+                    escaped = false;
+                },
+                '(' => {
+                    if !in_string {
+                        depth += 1;
+                    }
+                    escaped = false;
+                },
+                ')' => {
+                    if !in_string {
+                        depth -= 1;
+                        if depth == 0 {
+                            // Found the end of the VALUES section
+                            end_pos = header_end_pos + i + 1;
+                            
+                            // Look for a semicolon or another closing paren
+                            for j in i+1..chars.len() {
+                                if chars[j] == ';' {
+                                    end_pos = header_end_pos + j + 1;
+                                    break;
+                                } else if !chars[j].is_whitespace() {
+                                    break;
+                                }
+                            }
+                            
+                            break;
+                        }
+                    }
+                    escaped = false;
+                },
+                _ => {
+                    escaped = false;
+                }
+            }
+        }
+        
+        if depth > 0 && verbose {
+            println!("Warning: Could not find end of VALUES section for INSERT statement {}", index + 1);
+            continue;
+        }
+        
+        // Extract the VALUES section
+        let values_section = &result[header_end_pos..end_pos];
         
         // Format the INSERT statement
         let formatted_insert = format_insert_statement(header, values_section, verbose);
         
         // Replace the original with the formatted version
-        result.replace_range(
-            (start_pos + offset)..(end_pos + offset),
-            &formatted_insert
-        );
-        
-        // Adjust offset for future replacements
-        offset += formatted_insert.len() - match_len;
+        result.replace_range(start_pos..end_pos, &formatted_insert);
     }
-    
-    // Clean up any trailing parentheses
-    result = Regex::new(r"\)\)\);?").unwrap().replace(&result, ");").to_string();
     
     result
 }
@@ -181,106 +235,167 @@ fn format_sql_inserts(sql: &str, verbose: bool) -> String {
 fn format_insert_statement(header: &str, values_section: &str, verbose: bool) -> String {
     if verbose {
         println!("Formatting INSERT values section");
-        println!("Values section: {}", values_section);
     }
     
-    // Cleanup the values section first - remove any extra trailing parentheses
-    let clean_values = values_section.trim_end_matches(')');
+    // The values section starts with an opening parenthesis and includes all content up to the final closing parenthesis
+    // It might contain nested function calls like JSON_ARRAY() with their own parentheses
     
-    // Split values into rows by finding closing and opening parentheses patterns
-    let row_regex = Regex::new(r"\)\s*,\s*\(").unwrap();
+    // First, let's identify the rows by tokenizing while respecting nested structures
+    let mut rows = Vec::new();
+    let mut current_row = String::new();
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escaped = false;
     
-    // Make sure we have the values properly enclosed in parentheses for splitting
-    let rows_text = if clean_values.contains("),") {
-        format!("({})", clean_values)
-    } else {
-        format!("({}", clean_values)
-    };
+    for c in values_section.chars() {
+        match c {
+            '\\' => {
+                current_row.push(c);
+                escaped = !escaped;
+            },
+            '\'' => {
+                current_row.push(c);
+                if !escaped {
+                    in_string = !in_string;
+                }
+                escaped = false;
+            },
+            '(' => {
+                current_row.push(c);
+                if !in_string {
+                    depth += 1;
+                }
+                escaped = false;
+            },
+            ')' => {
+                current_row.push(c);
+                if !in_string {
+                    depth -= 1;
+                    // If we've closed a top-level row parenthesis
+                    if depth == 0 {
+                        // Don't add empty rows
+                        if !current_row.trim().is_empty() {
+                            rows.push(current_row.trim().to_string());
+                            current_row = String::new();
+                        }
+                    }
+                }
+                escaped = false;
+            },
+            ',' => {
+                if !in_string && depth == 1 {
+                    // End of a column value at the top level
+                    current_row.push(c);
+                } else if !in_string && depth == 0 {
+                    // This is a comma between rows - skip it
+                } else {
+                    // This is a comma inside a string or a nested structure
+                    current_row.push(c);
+                }
+                escaped = false;
+            },
+            _ => {
+                // Skip leading whitespace at depth 0
+                if !(depth == 0 && c.is_whitespace()) {
+                    current_row.push(c);
+                }
+                escaped = false;
+            }
+        }
+    }
     
-    let mut rows: Vec<&str> = row_regex.split(&rows_text).collect();
+    // Add the last row if it's not empty
+    if !current_row.trim().is_empty() {
+        rows.push(current_row.trim().to_string());
+    }
     
     if verbose {
-        println!("Found {} value rows", rows.len());
+        println!("Identified {} rows", rows.len());
     }
     
-    // Clean up rows (remove trailing/leading parentheses)
-    for i in 0..rows.len() {
-        rows[i] = rows[i].trim();
-        if rows[i].ends_with(')') {
-            rows[i] = &rows[i][..rows[i].len() - 1];
-        }
-        if rows[i].starts_with('(') {
-            rows[i] = &rows[i][1..];
-        }
-    }
+    // Now that we have the rows, extract the column values from each row
+    let mut values_per_row = Vec::new();
     
-    // Parse each row into values, properly handling quoted strings and functions
-    let mut values_per_row: Vec<Vec<String>> = Vec::new();
-    
-    for row in rows {
-        let mut values = Vec::new();
-        let mut current_value = String::new();
-        let mut in_quote = false;
-        let mut in_function = 0; // Nested function depth counter
+    for (i, row) in rows.iter().enumerate() {
+        if verbose {
+            println!("Processing row {}: {}", i + 1, row);
+        }
+        
+        // Strip the outer parentheses
+        let row_content = row.trim_start_matches('(').trim_end_matches(')').trim();
+        
+        // Split the row into columns
+        let mut columns = Vec::new();
+        let mut current_column = String::new();
+        let mut depth = 0;
+        let mut in_string = false;
         let mut escaped = false;
         
-        for c in row.chars() {
+        for c in row_content.chars() {
             match c {
                 '\\' => {
-                    current_value.push(c);
-                    escaped = true;
+                    current_column.push(c);
+                    escaped = !escaped;
                 },
                 '\'' => {
-                    current_value.push(c);
+                    current_column.push(c);
                     if !escaped {
-                        in_quote = !in_quote;
+                        in_string = !in_string;
                     }
                     escaped = false;
                 },
                 '(' => {
-                    current_value.push(c);
-                    if !in_quote {
-                        in_function += 1;
+                    current_column.push(c);
+                    if !in_string {
+                        depth += 1;
                     }
                     escaped = false;
                 },
                 ')' => {
-                    current_value.push(c);
-                    if !in_quote && in_function > 0 {
-                        in_function -= 1;
+                    current_column.push(c);
+                    if !in_string {
+                        depth -= 1;
                     }
                     escaped = false;
                 },
                 ',' => {
-                    if in_quote || in_function > 0 {
-                        current_value.push(c);
+                    if in_string || depth > 0 {
+                        // This comma is part of a string or a nested function call
+                        current_column.push(c);
                     } else {
-                        values.push(current_value.trim().to_string());
-                        current_value = String::new();
+                        // This comma separates columns
+                        columns.push(current_column.trim().to_string());
+                        current_column = String::new();
                     }
                     escaped = false;
                 },
                 _ => {
-                    current_value.push(c);
+                    current_column.push(c);
                     escaped = false;
                 }
             }
         }
         
-        if !current_value.is_empty() {
-            values.push(current_value.trim().to_string());
+        // Add the last column
+        if !current_column.trim().is_empty() {
+            columns.push(current_column.trim().to_string());
         }
         
-        values_per_row.push(values);
+        if verbose {
+            println!("Row {} has {} columns", i + 1, columns.len());
+        }
+        
+        values_per_row.push(columns);
     }
     
     // Find the maximum width for each column
     let column_count = values_per_row.iter().map(|row| row.len()).max().unwrap_or(0);
     
     if verbose {
-        println!("Found {} columns", column_count);
+        println!("Maximum column count: {}", column_count);
     }
     
+    // Calculate column widths
     let mut column_widths = vec![0; column_count];
     
     for row in &values_per_row {
@@ -307,7 +422,8 @@ fn format_insert_statement(header: &str, values_section: &str, verbose: bool) ->
             }
             
             // Right-align numbers, left-align everything else
-            if (value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok()) && !value.starts_with('\'') {
+            // Note: we don't try to parse functions or complex expressions
+            if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() || value == "NULL" {
                 formatted_row.push_str(&format!("{:>width$}", value, width=column_widths[i]));
             } else {
                 formatted_row.push_str(&format!("{:<width$}", value, width=column_widths[i]));
