@@ -13,9 +13,9 @@ struct Args {
     #[clap(required = true)]
     input: String,
 
-    /// Write changes back to files instead of printing to stdout
+    /// Print to stdout instead of writing back to files
     #[clap(short, long)]
-    write: bool,
+    print: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,16 +23,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Expand the glob pattern to get matching files
     let paths = glob(&args.input)?;
+    let mut processed_files = 0;
     
     for entry in paths {
         match entry {
             Ok(path) => {
-                if path.extension().map_or(false, |ext| ext == "sql") {
-                    process_file(&path, args.write)?;
+                // Only process files with .sql extension
+                if path.extension().map_or(false, |ext| ext.to_str().unwrap_or("") == "sql") {
+                    process_file(&path, !args.print)?;
+                    processed_files += 1;
                 }
             }
             Err(e) => eprintln!("Error matching glob pattern: {}", e),
         }
+    }
+    
+    if processed_files == 0 {
+        println!("No SQL files found matching pattern: {}", args.input);
+    } else {
+        println!("Processed {} SQL file(s)", processed_files);
     }
     
     Ok(())
@@ -49,6 +58,12 @@ fn process_file(path: &PathBuf, write_to_file: bool) -> Result<(), Box<dyn std::
     // Format the content
     let formatted_content = format_sql(&content);
     
+    // Check if content actually changed
+    if content == formatted_content {
+        println!("No changes needed for: {}", path.display());
+        return Ok(());
+    }
+    
     if write_to_file {
         // Write back to the file
         let mut output_file = File::create(path)?;
@@ -56,7 +71,7 @@ fn process_file(path: &PathBuf, write_to_file: bool) -> Result<(), Box<dyn std::
         println!("Formatted and saved: {}", path.display());
     } else {
         // Print to stdout
-        println!("Formatted SQL:\n{}", formatted_content);
+        println!("Formatted SQL for {}:\n{}", path.display(), formatted_content);
     }
     
     Ok(())
@@ -110,37 +125,66 @@ fn format_sql(sql: &str) -> String {
 }
 
 fn format_insert_statement(stmt: &str) -> String {
-    // Split the statement into parts
-    let parts: Vec<&str> = stmt.split("VALUES").collect();
-    if parts.len() != 2 {
-        return stmt.to_string(); // Return as is if it doesn't match our expectation
+    // First, check if this is a multi-line INSERT statement
+    let lines: Vec<&str> = stmt.lines().collect();
+    if lines.len() <= 1 {
+        return stmt.to_string(); // Already a single line, return as is
     }
     
-    let insert_part = parts[0].trim();
-    let values_part = parts[1].trim();
+    // Find the INSERT INTO part and VALUES part
+    let insert_pattern = Regex::new(r"(?i)^(INSERT\s+INTO\s+\w+\s*\([^)]+\))").unwrap();
+    let values_pattern = Regex::new(r"(?i)\bVALUES\s*").unwrap();
     
-    // Format the VALUES part
-    // First, identify the individual value tuples
-    let re_values = Regex::new(r"\(\s*([^)]+)\s*\)").unwrap();
-    let mut formatted_values = String::from("VALUES");
+    let mut insert_part = String::new();
+    let mut full_stmt = stmt.to_string();
     
-    for cap in re_values.captures_iter(values_part) {
-        if let Some(values_match) = cap.get(0) {
-            let values_tuple = values_match.as_str();
-            formatted_values.push_str("\n    ");
-            formatted_values.push_str(values_tuple);
-            formatted_values.push_str(",");
+    // Extract INSERT INTO part
+    if let Some(insert_match) = insert_pattern.find(full_stmt.as_str()) {
+        insert_part = insert_match.as_str().to_string();
+        // Remove the INSERT part from the full statement
+        full_stmt = full_stmt[insert_match.end()..].to_string();
+    } else {
+        return stmt.to_string(); // Couldn't find INSERT INTO part
+    }
+    
+    // Format VALUES
+    let mut values_keyword_pos = 0;
+    if let Some(values_match) = values_pattern.find(full_stmt.as_str()) {
+        values_keyword_pos = values_match.end();
+    } else {
+        return stmt.to_string(); // Couldn't find VALUES keyword
+    }
+    
+    let values_keyword = &full_stmt[..values_keyword_pos];
+    let values_data = &full_stmt[values_keyword_pos..];
+    
+    // Parse individual value tuples
+    let value_tuples_pattern = Regex::new(r"\(\s*[^)]+\s*\)").unwrap();
+    let mut value_tuples = Vec::new();
+    
+    for value_match in value_tuples_pattern.find_iter(values_data) {
+        value_tuples.push(value_match.as_str().to_string());
+    }
+    
+    // Check for trailing semicolon
+    let has_semicolon = stmt.trim_end().ends_with(';');
+    
+    // Build the formatted statement
+    let mut formatted = format!("{} {}", insert_part.trim(), values_keyword.trim());
+    
+    for (i, tuple) in value_tuples.iter().enumerate() {
+        if i == 0 {
+            formatted.push_str("\n    ");
+        } else {
+            formatted.push_str(",\n    ");
         }
+        formatted.push_str(tuple.trim());
     }
     
-    // Remove the last comma and add semicolon if present in original
-    if formatted_values.ends_with(",") {
-        formatted_values.pop();
-        if values_part.trim_end().ends_with(";") {
-            formatted_values.push(';');
-        }
+    // Add semicolon if needed
+    if has_semicolon {
+        formatted.push(';');
     }
     
-    // Combine the parts
-    format!("{}\n{}", insert_part, formatted_values)
+    formatted
 }
