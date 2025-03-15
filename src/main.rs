@@ -174,7 +174,14 @@ fn line_is_values_line(line: &str) -> bool {
 
 fn line_is_values_row(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed.starts_with('(') && (trimmed.ends_with("),") || trimmed.ends_with(");") || trimmed.ends_with(')'))
+    trimmed.starts_with('(') && (
+        trimmed.ends_with("),") || 
+        trimmed.ends_with(");") || 
+        trimmed.ends_with("););") || 
+        trimmed.ends_with("););") || 
+        trimmed.ends_with(')') || 
+        trimmed.contains(";);")
+    )
 }
 
 fn parse_values_row(line: &str) -> Vec<String> {
@@ -186,8 +193,16 @@ fn parse_values_row(line: &str) -> Vec<String> {
     let mut paren_level = 0;
     let mut first_paren_found = false;
     
-    // Clean up the line first - remove any trailing comma before closing parenthesis
-    let cleaned_line = line.trim().replace(" ,)", ")").replace(",)", ")");
+    // Fix the line before processing - handle several common issues
+    let mut cleaned_line = line.trim().to_string();
+    
+    // Replace problematic endings
+    if cleaned_line.ends_with(";);") {
+        cleaned_line = cleaned_line.replace(";);", ");");
+    }
+    
+    // Remove trailing commas before closing parentheses
+    cleaned_line = cleaned_line.replace(" ,)", ")").replace(",)", ")");
     
     for c in cleaned_line.chars() {
         if !escaped && (c == '\'' || c == '"') {
@@ -213,6 +228,8 @@ fn parse_values_row(line: &str) -> Vec<String> {
                     values.push(current.trim().to_string());
                     current = String::new();
                 }
+                // Stop processing after the closing parenthesis
+                break;
             } else {
                 current.push(c);
                 paren_level -= 1;
@@ -278,14 +295,10 @@ fn format_insert_statement(insert: InsertStatement) -> String {
         
         // Add row terminator
         if i == insert.rows.len() - 1 {
-            // Fix malformed terminators like ";);" to just ");"
-            let terminator = if insert.terminator.contains(";);") {
-                ");".to_string()
-            } else {
-                insert.terminator.clone()
-            };
-            result.push_str(&terminator);
+            // Last row, add semicolon
+            result.push_str(");");
         } else {
+            // Not the last row, add comma
             result.push_str("),");
         }
         
