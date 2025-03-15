@@ -6,5 +6,6 @@ description = "Format SQL files with perfect grid alignment"
 authors = ["Tristan J. Poland"]
 
 [dependencies]
+clap = { version = "4.4", features = ["derive"] }
+glob = "0.3"
 regex = "1.10"
-clap = "2.34.0"  # Using clap v2 for simpler syntax
