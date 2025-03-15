@@ -140,8 +140,8 @@ fn format_sql_inserts(sql: &str, verbose: bool) -> String {
         println!("Formatting INSERT statements");
     }
     
-    // Find all INSERT statements
-    let insert_regex = Regex::new(r"(?is)(INSERT\s+INTO\s+[\w\.]+\s*\([^)]+\))\s*VALUES\s*\n?\s*\(([^;]+)(?:;|$)").unwrap();
+    // Find all INSERT statements - improved regex to better match complete statements
+    let insert_regex = Regex::new(r"(?is)(INSERT\s+INTO\s+[\w\.]+\s*\([^)]+\))\s*VALUES\s*\n?\s*\(([^;]+)(?:;|\)\)\)|$)").unwrap();
     
     let mut result = String::from(sql);
     let mut offset = 0;
@@ -172,20 +172,29 @@ fn format_sql_inserts(sql: &str, verbose: bool) -> String {
         offset += formatted_insert.len() - match_len;
     }
     
+    // Clean up any trailing parentheses
+    result = Regex::new(r"\)\)\);?").unwrap().replace(&result, ");").to_string();
+    
     result
 }
 
 fn format_insert_statement(header: &str, values_section: &str, verbose: bool) -> String {
     if verbose {
         println!("Formatting INSERT values section");
+        println!("Values section: {}", values_section);
     }
+    
+    // Cleanup the values section first - remove any extra trailing parentheses
+    let clean_values = values_section.trim_end_matches(')');
     
     // Split values into rows by finding closing and opening parentheses patterns
     let row_regex = Regex::new(r"\)\s*,\s*\(").unwrap();
-    let rows_text = if values_section.contains("),") {
-        format!("({})", values_section)
+    
+    // Make sure we have the values properly enclosed in parentheses for splitting
+    let rows_text = if clean_values.contains("),") {
+        format!("({})", clean_values)
     } else {
-        format!("({}", values_section)
+        format!("({}", clean_values)
     };
     
     let mut rows: Vec<&str> = row_regex.split(&rows_text).collect();
@@ -297,11 +306,8 @@ fn format_insert_statement(header: &str, values_section: &str, verbose: bool) ->
                 formatted_row.push_str(", ");
             }
             
-            // Right-align numbers, POINTs, and numeric functions; left-align everything else
-            if value.starts_with("POINT(") || 
-               (value.parse::<f64>().is_ok() && !value.starts_with('\'')) || 
-               value.parse::<i64>().is_ok() || 
-               value == "0" || value == "1" {
+            // Right-align numbers, left-align everything else
+            if (value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok()) && !value.starts_with('\'') {
                 formatted_row.push_str(&format!("{:>width$}", value, width=column_widths[i]));
             } else {
                 formatted_row.push_str(&format!("{:<width$}", value, width=column_widths[i]));
